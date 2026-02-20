@@ -4,20 +4,32 @@ using System.Text;
 using System.Net.Http.Headers;
 using Newtonsoft.Json.Linq;
 using System.Runtime.CompilerServices;
+using System.Data;
+using System.Data.Common;
+using FirebirdSql.Data.FirebirdClient;
 
 namespace LsiGestor
 {
     public partial class Form1 : Form
     {
+        private int _isExecuting = 0; // 0 = livre, 1 = executando
+
         private static string connectionString;
         private bool isRunning = true;
-        private TimeSpan interval = TimeSpan.FromMinutes(30); // tempo de envio
+        private TimeSpan interval = TimeSpan.FromMinutes(10); // tempo de envio
         private CancellationTokenSource cancellationTokenSource;
         private ContextMenuStrip contextMenuStrip;
         private int idEmpresa_TERMINAL;
         private int idEmpresa_API;
         private static string apiUrl;
         private string initialSendConfigFilePath = "initialSendConfig.txt"; // Caminho para o arquivo de configura��o de envio inicial
+        public enum TipoBanco
+        {
+            SqlServer,
+            Firebird
+        }
+        private static TipoBanco tipoBanco;
+
         public Form1()
         {
             InitializeComponent();
@@ -324,11 +336,31 @@ namespace LsiGestor
                         }
                     }
 
-                    if (!string.IsNullOrEmpty(servidor) && !string.IsNullOrEmpty(banco) && !string.IsNullOrEmpty(usuario) && !string.IsNullOrEmpty(senha) && !string.IsNullOrEmpty(tipoBanco))
+                    if (!string.IsNullOrEmpty(servidor) &&
+                        !string.IsNullOrEmpty(banco) &&
+                        !string.IsNullOrEmpty(usuario) &&
+                        !string.IsNullOrEmpty(senha) &&
+                        !string.IsNullOrEmpty(tipoBanco))
                     {
-                        connectionString = $"Data Source={servidor};Initial Catalog={banco};User ID={usuario};Password={senha};";// Conex�o para SQL
-
+                        if (tipoBanco.ToUpper() == "SQLSERVER")
+                        {
+                            Form1.tipoBanco = TipoBanco.SqlServer;
+                            connectionString =
+                                $"Data Source={servidor};Initial Catalog={banco};User ID={usuario};Password={senha};";
+                        }
+                        else if (tipoBanco.ToUpper() == "FIREBIRD")
+                        {
+                            Form1.tipoBanco = TipoBanco.Firebird;
+                            connectionString =
+                                $"Database={banco};DataSource={servidor};User={usuario};Password={senha};Charset=UTF8;";
+                        }
+                        else
+                        {
+                            MessageBox.Show("TIPO_BANCO inválido. Use SQLSERVER ou FIREBIRD.");
+                            Application.Exit();
+                        }
                     }
+
                     else
                     {
                         MessageBox.Show("As informa��es do banco de dados n�o foram encontradas ou est�o incompletas.");
@@ -347,6 +379,17 @@ namespace LsiGestor
                 Application.Exit();
             }
         }
+        private DbConnection CreateConnection()
+        {
+            if (tipoBanco == TipoBanco.SqlServer)
+                return new SqlConnection(connectionString);
+
+            if (tipoBanco == TipoBanco.Firebird)
+                return new FirebirdSql.Data.FirebirdClient.FbConnection(connectionString);
+
+            throw new NotSupportedException("Banco de dados não suportado.");
+        }
+
         private void LoadConnectionString()
         {
             if (File.Exists("Terminal.conf"))
@@ -400,67 +443,46 @@ namespace LsiGestor
             }
         }
 
-        private void ConnectToDatabase(string connectionString)
-        {
-            using (SqlConnection connection = new SqlConnection(connectionString))
-            {
-                connection.Open();
-            }
-        }
-
         private async Task BackgroundWorkerAsync(CancellationToken cancellationToken)
         {
             try
             {
-                while (isRunning && !cancellationToken.IsCancellationRequested)
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    // Executa os m�todos de envio
-                    try
+                    // evita reentrância (não deixa executar se ainda não terminou)
+                    if (Interlocked.CompareExchange(ref _isExecuting, 1, 0) == 0)
                     {
-                        await ExecuteSendMethods();
-                    }
-                    catch (Exception ex)
-                    {
-                        UpdateResponseTextBox($"Erro durante o envio: {ex.Message}");
+                        try
+                        {
+                            await ExecuteSendMethods();
+                        }
+                        catch (Exception ex)
+                        {
+                            UpdateResponseTextBox($"Erro durante o envio: {ex.Message}");
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref _isExecuting, 0);
+                        }
                     }
 
-                    // Aguarda 30 minutos para o pr�ximo envio
-                    await Task.Delay(interval, cancellationToken);
+                    await Task.Delay(TimeSpan.FromMinutes(10), cancellationToken); // loop a cada 1 minuto fixo
                 }
             }
             catch (OperationCanceledException)
             {
-                UpdateResponseTextBox("Opera��o cancelada.");
-            }
-            finally
-            {
-                isRunning = false;
+                UpdateResponseTextBox("Operação cancelada.");
             }
         }
 
 
-        private async void buttonStartLoop_Click(object sender, EventArgs e)
+
+        private void buttonStartLoop_Click(object sender, EventArgs e)
         {
-            if (cancellationTokenSource != null)
-            {
-                // Se j� estiver rodando, cancela primeiro
-                cancellationTokenSource.Cancel();
-            }
+            cancellationTokenSource?.Cancel();
 
             cancellationTokenSource = new CancellationTokenSource();
-            isRunning = true;
 
-            // Executa imediatamente uma primeira vez
-            try
-            {
-                await ExecuteSendMethods();
-            }
-            catch (Exception ex)
-            {
-                UpdateResponseTextBox($"Erro durante o envio inicial: {ex.Message}");
-            }
-
-            // Inicia o loop de envio cont�nuo
             _ = Task.Run(() => BackgroundWorkerAsync(cancellationTokenSource.Token));
         }
 
@@ -478,7 +500,7 @@ namespace LsiGestor
         }
         private async void buttonParcelas_Click(object sender, EventArgs e)
         {
-            await ExecuteSendParcelas();
+           // await ExecuteSendParcelas();
         }
 
         private async Task ExecuteSendMethods()
@@ -559,9 +581,9 @@ namespace LsiGestor
                 UpdateResponseTextBox("Upload realizado para Promo��o dos Produtos");
                 textBoxResponse.Clear();
 
-                UpdateResponseTextBox("Aguarde, realizando upload de Parcelas...");
+/*                UpdateResponseTextBox("Aguarde, realizando upload de Parcelas...");
                 await SendParcelas(idEmpresa_API);
-                UpdateResponseTextBox("Upload realizado para Parcelas");
+                UpdateResponseTextBox("Upload realizado para Parcelas");*/
                 // textBoxResponse.Clear();
 
                 /*                UpdateResponseTextBox("Aguarde, realizando upload de Parcelas Detalhe...");
@@ -1102,58 +1124,65 @@ namespace LsiGestor
         {
             var parcelas = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT 
-                v.ID, v.HISTORICO, v.ID_TIPO_PAGAMENTO, v.ID_PLANO_CONTA, v.ID_PESSOA, v.TIPO, v.NUMERO_DOCUMENTO,
-                v.VALOR_TOTAL, v.DATA_LANCAMENTO, v.PRIMEIRO_VENCIMENTO, v.QUANTIDADE_PARCELA, v.ID_MOVIMENTACAO, v.ID_EMPRESA, 
-                v.INTERVALO_VENCIMENTO, v.ID_CENTRO_CUSTO, v.STATUS_PREVISAO, v.FIXA_VENCIMENTO, v.ID_TERMINAL_PDV, v.BOLETO_IMPRESSO, 
-                v.STBAIXA_RETORNO, v.STATUS_ESTORNO
-            FROM CONTAS_PARCELAS v
-            INNER JOIN LOG_EXPORT_REPLI l ON l.ID_TABELA = v.ID
-            INNER JOIN CONTAS_DETALHE cd ON cd.ID_CONTAS_PARCELAS = v.ID
-            WHERE l.INTEGRADO = 'N' 
-              AND v.ID_EMPRESA = @idEmpresa 
-              AND l.TABELA = 'CONTAS_PARCELAS'
-              AND cd.ID_SITUACAO_PARCELA in (1,2)", connection);
 
-                command.Parameters.AddWithValue("@idEmpresa", idEmpresa_TERMINAL);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT 
+                        v.ID, v.HISTORICO, v.ID_TIPO_PAGAMENTO, v.ID_PLANO_CONTA, v.ID_PESSOA, v.TIPO, v.NUMERO_DOCUMENTO,
+                        v.VALOR_TOTAL, v.DATA_LANCAMENTO, v.PRIMEIRO_VENCIMENTO, v.QUANTIDADE_PARCELA, v.ID_MOVIMENTACAO, v.ID_EMPRESA, 
+                        v.INTERVALO_VENCIMENTO, v.ID_CENTRO_CUSTO, v.STATUS_PREVISAO, v.FIXA_VENCIMENTO, v.ID_TERMINAL_PDV, v.BOLETO_IMPRESSO, 
+                        v.STBAIXA_RETORNO, v.STATUS_ESTORNO
+                    FROM CONTAS_PARCELAS v
+                    INNER JOIN LOG_EXPORT_REPLI l ON l.ID_TABELA = v.ID
+                    INNER JOIN CONTAS_DETALHE cd ON cd.ID_CONTAS_PARCELAS = v.ID
+                    WHERE l.INTEGRADO = 'N' 
+                      AND v.ID_EMPRESA = @idEmpresa 
+                      AND l.TABELA = 'CONTAS_PARCELAS'
+                      AND cd.ID_SITUACAO_PARCELA in (1,2)";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        parcelas.Add(new
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            idOriginal = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            historico = reader["HISTORICO"] as string,
-                            id_tipo_pagamento = reader["ID_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_TIPO_PAGAMENTO"]) : (int?)null,
-                            id_plano_conta = reader["ID_PLANO_CONTA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PLANO_CONTA"]) : 0,
-                            id_pessoa = reader["ID_PESSOA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PESSOA"]) : 0,
-                            tipo = reader["TIPO"] as string,
-                            numero_documento = reader["NUMERO_DOCUMENTO"] as string,
-                            valor_total = reader["VALOR_TOTAL"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_TOTAL"]) : 0m,
-                            data_lancamento = reader["DATA_LANCAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_LANCAMENTO"]) : (DateTime?)null,
-                            primeiro_vencimento = reader["PRIMEIRO_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["PRIMEIRO_VENCIMENTO"]) : (DateTime?)null,
-                            quantidade_parcela = reader["QUANTIDADE_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["QUANTIDADE_PARCELA"]) : (int?)null,
-                            id_movimentacao = reader["ID_MOVIMENTACAO"] != DBNull.Value ? Convert.ToInt32(reader["ID_MOVIMENTACAO"]) : 0,
-                            id_empresa = reader["ID_EMPRESA"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA"]) : 0,
-                            intervalo_vencimento = reader["INTERVALO_VENCIMENTO"] != DBNull.Value ? Convert.ToInt32(reader["INTERVALO_VENCIMENTO"]) : (int?)null,
-                            id_centro_custo = reader["ID_CENTRO_CUSTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_CENTRO_CUSTO"]) : 0,
-                            status_previsao = reader["STATUS_PREVISAO"] as string,
-                            fixa_vencimento = reader["FIXA_VENCIMENTO"] as string,
-                            id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
-                            boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
-                            stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
-                            status_estorno = reader["STATUS_ESTORNO"] as string
-                        });
+                            parcelas.Add(new
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                idOriginal = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                historico = reader["HISTORICO"] as string,
+                                id_tipo_pagamento = reader["ID_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_TIPO_PAGAMENTO"]) : (int?)null,
+                                id_plano_conta = reader["ID_PLANO_CONTA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PLANO_CONTA"]) : 0,
+                                id_pessoa = reader["ID_PESSOA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PESSOA"]) : 0,
+                                tipo = reader["TIPO"] as string,
+                                numero_documento = reader["NUMERO_DOCUMENTO"] as string,
+                                valor_total = reader["VALOR_TOTAL"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_TOTAL"]) : 0m,
+                                data_lancamento = reader["DATA_LANCAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_LANCAMENTO"]) : (DateTime?)null,
+                                primeiro_vencimento = reader["PRIMEIRO_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["PRIMEIRO_VENCIMENTO"]) : (DateTime?)null,
+                                quantidade_parcela = reader["QUANTIDADE_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["QUANTIDADE_PARCELA"]) : (int?)null,
+                                id_movimentacao = reader["ID_MOVIMENTACAO"] != DBNull.Value ? Convert.ToInt32(reader["ID_MOVIMENTACAO"]) : 0,
+                                id_empresa = reader["ID_EMPRESA"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA"]) : 0,
+                                intervalo_vencimento = reader["INTERVALO_VENCIMENTO"] != DBNull.Value ? Convert.ToInt32(reader["INTERVALO_VENCIMENTO"]) : (int?)null,
+                                id_centro_custo = reader["ID_CENTRO_CUSTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_CENTRO_CUSTO"]) : 0,
+                                status_previsao = reader["STATUS_PREVISAO"] as string,
+                                fixa_vencimento = reader["FIXA_VENCIMENTO"] as string,
+                                id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
+                                boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
+                                stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
+                                status_estorno = reader["STATUS_ESTORNO"] as string
+                            });
+                        }
                     }
                 }
             }
-
             return parcelas.ToArray();
         }
 
@@ -1420,34 +1449,49 @@ namespace LsiGestor
 
         private void UpdateNotaFiscalCabecalhoXmlNuvem(int notaId, string fileId)
         {
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            UPDATE NOTA_FISCAL_CABECALHO
-            SET XML_NUVEM = @fileId
-            WHERE id = @notaId
-        ", connection);
 
-                command.Parameters.AddWithValue("@fileId", fileId ?? (object)DBNull.Value);
-                command.Parameters.AddWithValue("@notaId", notaId);
-                command.ExecuteNonQuery();
+                using (DbCommand command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+                    UPDATE NOTA_FISCAL_CABECALHO
+                    SET XML_NUVEM = @fileId
+                    WHERE id = @notaId";
+
+                    var pFile = command.CreateParameter();
+                    pFile.ParameterName = "@fileId";
+                    pFile.Value = fileId;
+                    command.Parameters.Add(pFile);
+
+                    var pNota = command.CreateParameter();
+                    pNota.ParameterName = "@notaId";
+                    pNota.Value = notaId;
+                    command.Parameters.Add(pNota);
+                    command.ExecuteNonQuery();
+                }
             }
         }
         private void UpdateFuncionarioStatus(int funcionarioId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'ECF_FUNCIONARIO'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", funcionarioId);
+                        AND ID_TABELA = @id;";
+
+                    var pFuncionario = command.CreateParameter();
+                    pFuncionario.ParameterName = "@id";
+                    pFuncionario.Value = funcionarioId;
+                    command.Parameters.Add(pFuncionario);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1457,18 +1501,23 @@ namespace LsiGestor
 
         private void UpdateProdutoStatus(int produtoId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'GRUPO_PRODUTO'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", produtoId);
+                        AND ID_TABELA = @id;";
+
+                    var pProduto = command.CreateParameter();
+                    pProduto.ParameterName = "@id";
+                    pProduto.Value = produtoId;
+                    command.Parameters.Add(pProduto);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1478,18 +1527,22 @@ namespace LsiGestor
 
         private void UpdateMovimentoCaixaStatus(int caixaId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                     UPDATE LOG_EXPORT_CLOUD
                     SET INTEGRADO = 'S'
                     WHERE TABELA IN ('ECF_SANGRIA', 'ECF_SUPRIMENTO')
-                    AND ID_TABELA = @id;
+                    AND ID_TABELA = @id;";
 
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", caixaId);
+                    var pCaixa = command.CreateParameter();
+                    pCaixa.ParameterName = "@id";
+                    pCaixa.Value = caixaId;
+                    command.Parameters.Add(pCaixa);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1499,18 +1552,23 @@ namespace LsiGestor
 
         private void UpdateProdutoLStatus(int produtoLId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'PRODUTO'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", produtoLId);
+                        AND ID_TABELA = @id;";
+
+                    var pProduto = command.CreateParameter();
+                    pProduto.ParameterName = "@id";
+                    pProduto.Value = produtoLId;
+                    command.Parameters.Add(pProduto);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1520,18 +1578,23 @@ namespace LsiGestor
 
         private void UpdateClienteStatus(int clienteId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'Cliente'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", clienteId);
+                        AND ID_TABELA = @id;";
+
+                    var pCliente = command.CreateParameter();
+                    pCliente.ParameterName = "@id";
+                    pCliente.Value = clienteId;
+                    command.Parameters.Add(pCliente);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1541,18 +1604,23 @@ namespace LsiGestor
 
         private void UpdateCampanhaPromocao(int promocaoID)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'CAMPANHA_PROMOCAO_PRODUTO'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", promocaoID);
+                        AND ID_TABELA = @id;";
+
+                    var pPromo = command.CreateParameter();
+                    pPromo.ParameterName = "@id";
+                    pPromo.Value = promocaoID;
+                    command.Parameters.Add(pPromo);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1562,23 +1630,29 @@ namespace LsiGestor
 
         private void UpdateProdutoPromocao(int produtopromocaoID)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
-                        UPDATE 
-                            LOG_EXPORT_CLOUD
-                        SET 
-                            INTEGRADO = 'S'
-                        WHERE 
-                            TABELA = 'PRODUTO_PROMOCAO'
-                        AND 
-                            ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", produtopromocaoID);
+                    command.CommandText = @"
+                    UPDATE 
+                        LOG_EXPORT_CLOUD
+                    SET 
+                        INTEGRADO = 'S'
+                    WHERE 
+                        TABELA = 'PRODUTO_PROMOCAO'
+                    AND 
+                        ID_TABELA = @id;";
+
+                    var pPromo = command.CreateParameter();
+                    pPromo.ParameterName = "@id";
+                    pPromo.Value = produtopromocaoID;
+                    command.Parameters.Add(pPromo);
 
                     int rowsAffected = command.ExecuteNonQuery();
+
                     Console.WriteLine($"Rows affected: {rowsAffected}");
                 }
             }
@@ -1586,18 +1660,23 @@ namespace LsiGestor
 
         private void UpdateFormaPagamentoStatus(int formaPagamentoId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'ECF_TIPO_PAGAMENTO' 
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", formaPagamentoId);
+                        AND ID_TABELA = @id;";
+
+                    var pFormaPg = command.CreateParameter();
+                    pFormaPg.ParameterName = "@id";
+                    pFormaPg.Value = formaPagamentoId;
+                    command.Parameters.Add(pFormaPg);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1607,18 +1686,23 @@ namespace LsiGestor
 
         private void UpdateGrupoPagamentoStatus(int grupoPagamentoId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'GRUPO_PAGAMENTO' 
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", grupoPagamentoId);
+                        AND ID_TABELA = @id;";
+
+                    var pGrupoPg = command.CreateParameter();
+                    pGrupoPg.ParameterName = "@id";
+                    pGrupoPg.Value = grupoPagamentoId;
+                    command.Parameters.Add(pGrupoPg);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1628,18 +1712,23 @@ namespace LsiGestor
 
         private void UpdatePdvStatus(int pdvId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
+                    command.CommandText = @"
                         UPDATE 
                         LOG_EXPORT_CLOUD
                         SET INTEGRADO = 'S'
                         WHERE TABELA = 'TERMINAL_PDV'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", pdvId);
+                        AND ID_TABELA = @id;";
+
+                    var pPdv = command.CreateParameter();
+                    pPdv.ParameterName = "@id";
+                    pPdv.Value = pdvId;
+                    command.Parameters.Add(pPdv);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1649,18 +1738,23 @@ namespace LsiGestor
 
         private void UpdateQtdEstoque(int qtdEstoqueId)
         {
+            using (DbConnection connection = CreateConnection())
             {
-                using (var connection = new SqlConnection(connectionString))
+                connection.Open();
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    connection.Open();
-                    var command = new SqlCommand(@"
-                        UPDATE 
-                        LOG_EXPORT_CLOUD
-                        SET INTEGRADO = 'S'
-                        WHERE TABELA = 'ESTOQUE_PRODUTO'
-                        AND ID_TABELA = @id;
-                    ", connection);
-                    command.Parameters.AddWithValue("@id", qtdEstoqueId);
+                    command.CommandText = @"
+                    UPDATE 
+                    LOG_EXPORT_CLOUD
+                    SET INTEGRADO = 'S'
+                    WHERE TABELA = 'ESTOQUE_PRODUTO'
+                    AND ID_TABELA = @id;";
+
+                    var pQtd = command.CreateParameter();
+                    pQtd.ParameterName = "@id";
+                    pQtd.Value = qtdEstoqueId;
+                    command.Parameters.Add(pQtd);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     Console.WriteLine($"Rows affected: {rowsAffected}");
@@ -1670,40 +1764,56 @@ namespace LsiGestor
 
         private void UpdateNotaFiscalCabecalhoStatus(int notaFiscalId)
         {
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(
-                    "UPDATE NOTA_FISCAL_CABECALHO SET integrado = 'S' WHERE id = @id",
-                    connection);
-                command.Parameters.AddWithValue("@id", notaFiscalId);
 
-                int rowsAffected = command.ExecuteNonQuery();
-                Console.WriteLine($"Rows affected: {rowsAffected}");
+                using (DbCommand command = connection.CreateCommand())
+                {
+                    command.CommandText = "UPDATE NOTA_FISCAL_CABECALHO SET integrado = 'S' WHERE id = @id";
+
+                    var pNota = command.CreateParameter();
+                    pNota.ParameterName = "@id";
+                    pNota.Value = notaFiscalId;
+                    command.Parameters.Add(pNota);
+
+                    int rowsAffected = command.ExecuteNonQuery();
+                    Console.WriteLine($"Rows affected: {rowsAffected}");
+                }
             }
         }
         private void UpdateParcelaStatus(int parcelaId, string tabela)
         {
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                    UPDATE
-                        LOG_EXPORT_REPLI
-                    SET
-                        integrado = 'S'
-                    WHERE
-                        ID_TABELA = @id 
-                    AND 
-                        TABELA = @tabela",
-                    connection);
-                command.Parameters.AddWithValue("@id", parcelaId);
-                command.Parameters.AddWithValue("@tabela", tabela);
 
-                int rowsAffected = command.ExecuteNonQuery();
-                Console.WriteLine($"Rows affected: {rowsAffected}");
+                using (DbCommand command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+                UPDATE LOG_EXPORT_REPLI
+                SET integrado = 'S'
+                WHERE ID_TABELA = @id
+                  AND TABELA = @tabela";
+
+                    var pId = command.CreateParameter();
+                    pId.ParameterName = "@id";
+                    pId.Value = parcelaId;
+                    command.Parameters.Add(pId);
+
+                    var pTabela = command.CreateParameter();
+                    pTabela.ParameterName = "@tabela";
+                    pTabela.Value = tabela;
+                    command.Parameters.Add(pTabela);
+
+                    int rowsAffected = command.ExecuteNonQuery();
+
+                    // Log simples (igual você pediu antes)
+                    Console.WriteLine($"[UpdateParcelaStatus] ParcelaId={parcelaId} | Tabela={tabela} | Rows={rowsAffected}");
+                }
             }
         }
+
 
         /*        public async Task<string> PostAsync(string url, object data) //Post retorno JSON
                 {
@@ -1780,36 +1890,38 @@ namespace LsiGestor
         {
             var funcionarios = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
+
+                using (DbCommand command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
                     select c.id, c.NOME as descricao,
                     c.SENHA as senha,
                     (case when (select id from CARGO_FUNCIONARIO where ID_FUNCIONARIO=c.id and  ID_CARGO=2) > 0 then '1'else '0'end) as caixa,
                     (case when (select id from CARGO_FUNCIONARIO where ID_FUNCIONARIO=c.id and  ID_CARGO=1) > 0 then '0'else '1'end) as vendedor,
                     c.login
                     from vw_lst_funcionario_empresa c
-                    WHERE c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='ECF_FUNCIONARIO' and INTEGRADO='n')
-                ", connection);
+                    WHERE c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='ECF_FUNCIONARIO' and INTEGRADO='n')";
 
-                using (var reader = command.ExecuteReader())
-                {
-                    while (reader.Read())
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        funcionarios.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
-                            vendedor = reader.GetString(reader.GetOrdinal("vendedor")),
-                            caixa = reader.GetString(reader.GetOrdinal("caixa")),
-                            senha = reader.IsDBNull(reader.GetOrdinal("senha")) ? null : reader.GetString(reader.GetOrdinal("senha")),
-                            login = reader.IsDBNull(reader.GetOrdinal("login")) ? null : reader.GetString(reader.GetOrdinal("login"))
-                        });
+                            funcionarios.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
+                                vendedor = reader.GetString(reader.GetOrdinal("vendedor")),
+                                caixa = reader.GetString(reader.GetOrdinal("caixa")),
+                                senha = reader.IsDBNull(reader.GetOrdinal("senha")) ? null : reader.GetString(reader.GetOrdinal("senha")),
+                                login = reader.IsDBNull(reader.GetOrdinal("login")) ? null : reader.GetString(reader.GetOrdinal("login"))
+                            });
+                        }
                     }
                 }
             }
-
             return funcionarios.ToArray();
         }
 
@@ -1817,75 +1929,79 @@ namespace LsiGestor
         {
             var produtos = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT
-                    C.id, c.nome as descricao, COALESCE(c.TAXA_COMISSAO,0) as percentual_comissao
-                FROM 
-                    GRUPO_PRODUTO C 
-                WHERE 
-                    c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='GRUPO_PRODUTO' and INTEGRADO='N')
-                ", connection);
-                using (var reader = command.ExecuteReader())
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT
+                        C.id, c.nome as descricao, COALESCE(c.TAXA_COMISSAO,0) as percentual_comissao
+                    FROM 
+                        GRUPO_PRODUTO C 
+                    WHERE 
+                        c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='GRUPO_PRODUTO' and INTEGRADO='N')";
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        produtos.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.GetString(reader.GetOrdinal("descricao")),
-                            percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao"))
-                        });
+                            produtos.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.GetString(reader.GetOrdinal("descricao")),
+                                percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao"))
+                            });
+                        }
                     }
                 }
             }
-
             return produtos.ToArray();
         }
         private dynamic[] GetMovimentoCaixaFromDatabase()
         {
             var caixas = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT id, descricao,
-                       DATA_SANGRIA AS data_movimento, valor,
-                       ID_OPERADOR AS funcionario_id,
-                       1 AS tipo_movimento_caixa_id,
-                       ID_TERMINAL_PDV AS terminal_pdv_id
-                FROM ECF_SANGRIA
-                WHERE id IN (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA = 'ECF_SANGRIA' AND INTEGRADO = 'N')
-                UNION
-                SELECT id, descricao,
-                       DATA_SUPRIMENTO AS data_movimento, valor,
-                       ID_OPERADOR AS funcionario_id,
-                       2 AS tipo_movimento_caixa_id,
-                       ID_TERMINAL_PDV AS terminal_pdv_id
-                FROM ECF_SUPRIMENTO
-                WHERE id IN (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA = 'ECF_SUPRIMENTO' AND INTEGRADO = 'N');
-                ", connection);
-                using (var reader = command.ExecuteReader())
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT id, descricao,
+                           DATA_SANGRIA AS data_movimento, valor,
+                           ID_OPERADOR AS funcionario_id,
+                           1 AS tipo_movimento_caixa_id,
+                           ID_TERMINAL_PDV AS terminal_pdv_id
+                    FROM ECF_SANGRIA
+                    WHERE id IN (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA = 'ECF_SANGRIA' AND INTEGRADO = 'N')
+                    UNION
+                    SELECT id, descricao,
+                           DATA_SUPRIMENTO AS data_movimento, valor,
+                           ID_OPERADOR AS funcionario_id,
+                           2 AS tipo_movimento_caixa_id,
+                           ID_TERMINAL_PDV AS terminal_pdv_id
+                    FROM ECF_SUPRIMENTO
+                    WHERE id IN (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA = 'ECF_SUPRIMENTO' AND INTEGRADO = 'N');";
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        caixas.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.IsDBNull(reader.GetOrdinal("id")) ? 0 : reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? string.Empty : reader.GetString(reader.GetOrdinal("descricao")),
-                            data_movimento = reader.IsDBNull(reader.GetOrdinal("data_movimento")) ? DateTime.MinValue : reader.GetDateTime(reader.GetOrdinal("data_movimento")),
-                            valor = reader.IsDBNull(reader.GetOrdinal("valor")) ? 0 : reader.GetDecimal(reader.GetOrdinal("valor")),
-                            funcionario_id = reader.IsDBNull(reader.GetOrdinal("funcionario_id")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("funcionario_id")),
-                            tipo_movimento_caixa_id = reader.IsDBNull(reader.GetOrdinal("tipo_movimento_caixa_id")) ? 0 : reader.GetInt32(reader.GetOrdinal("tipo_movimento_caixa_id")),
-                            terminal_pdv_id = reader.IsDBNull(reader.GetOrdinal("terminal_pdv_id")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("terminal_pdv_id"))
-                        });
+                            caixas.Add(new
+                            {
+                                id = reader.IsDBNull(reader.GetOrdinal("id")) ? 0 : reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? string.Empty : reader.GetString(reader.GetOrdinal("descricao")),
+                                data_movimento = reader.IsDBNull(reader.GetOrdinal("data_movimento")) ? DateTime.MinValue : reader.GetDateTime(reader.GetOrdinal("data_movimento")),
+                                valor = reader.IsDBNull(reader.GetOrdinal("valor")) ? 0 : reader.GetDecimal(reader.GetOrdinal("valor")),
+                                funcionario_id = reader.IsDBNull(reader.GetOrdinal("funcionario_id")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("funcionario_id")),
+                                tipo_movimento_caixa_id = reader.IsDBNull(reader.GetOrdinal("tipo_movimento_caixa_id")) ? 0 : reader.GetInt32(reader.GetOrdinal("tipo_movimento_caixa_id")),
+                                terminal_pdv_id = reader.IsDBNull(reader.GetOrdinal("terminal_pdv_id")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("terminal_pdv_id"))
+                            });
+                        }
                     }
                 }
             }
-
             return caixas.ToArray();
         }
 
@@ -1893,68 +2009,73 @@ namespace LsiGestor
         {
             var produtosL = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT c.id, LEFT(c.NOME, 50) as descricao, gc.NOME as subgrupo_produto, c.ID_STATUS_PRODUTO,
-                cd.DESCRICAO as marca_produto, ud.NOME as unidade,
-                mr.FANTASIA as fornecedor, c.referencia, COALESCE(c.gtin, '') as gtin,
-                COALESCE(c.VALOR_COMISSAO, 0) as percentual_comissao, COALESCE(c.ESTOQUE_MIN, 0) as quantidade_minima,
-                COALESCE(c.ESTOQUE_MAX, 0) as quantidade_maxima, c.DESCRICAO_STORE as descricao_store, c.PRODUTO_DESTAQUE as produto_destaque,
-                c.id_grupo_produto as grupo_produto_id,
-                c.cest, c.ncm, c.VENDE_STORE,
-                COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=1 and pp.ID_PRODUTO=c.id), 0) as preco1,
-                COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=2 and pp.ID_PRODUTO=c.id), 0) as preco2,
-                COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=3 and pp.ID_PRODUTO=c.id), 0) as preco3,
-                COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=4 and pp.ID_PRODUTO=c.id), 0) as preco4,
 
-                coalesce((select ep.QTD_ESTOQUE from ESTOQUE_PRODUTO ep where ep.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and ep.ID_TIPO_ESTOQUE_PRODUTO=1 and ep.ID_PRODUTO=c.id),0) qtd_estoque,
-                coalesce((select ep.QTD_ESTOQUE from ESTOQUE_PRODUTO ep where ep.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and ep.ID_TIPO_ESTOQUE_PRODUTO=2 and ep.ID_PRODUTO=c.id),0) qtd_estoque2,
-                COALESCE(c.TAXA_COMISSAO,0) as percentual_comissao, ud.PODE_FRACIONAR as pode_fracionar
-                FROM produto C
-                INNER JOIN produto_marca cd ON cd.ID = c.ID_PRODUTO_MARCA
-                INNER JOIN SUBGRUPO_PRODUTO gc ON gc.ID = c.ID_SUBGRUPO_PRODUTO
-                INNER JOIN UNIDADE_PRODUTO ud ON ud.ID = c.ID_UNIDADE_PRODUTO
-                INNER JOIN FORNECEDOR mr ON mr.ID = c.ID_FORNECEDOR
-                and c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='PRODUTO' and INTEGRADO='N' )
-                    ", connection);
-
-
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT c.id, LEFT(c.NOME, 50) as descricao, gc.NOME as subgrupo_produto, c.ID_STATUS_PRODUTO,
+                    cd.DESCRICAO as marca_produto, ud.NOME as unidade,
+                    mr.FANTASIA as fornecedor, c.referencia, COALESCE(c.gtin, '') as gtin,
+                    COALESCE(c.VALOR_COMISSAO, 0) as percentual_comissao, COALESCE(c.ESTOQUE_MIN, 0) as quantidade_minima,
+                    COALESCE(c.ESTOQUE_MAX, 0) as quantidade_maxima, c.DESCRICAO_STORE as descricao_store, c.PRODUTO_DESTAQUE as produto_destaque,
+                    c.id_grupo_produto as grupo_produto_id,
+                    c.cest, c.ncm, c.VENDE_STORE,
+                    COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=1 and pp.ID_PRODUTO=c.id), 0) as preco1,
+                    COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=2 and pp.ID_PRODUTO=c.id), 0) as preco2,
+                    COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=3 and pp.ID_PRODUTO=c.id), 0) as preco3,
+                    COALESCE((select pp.VALOR_PRODUTO from preco_PRODUTO pp where pp.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and pp.ID_TIPO_PRECO_PRODUTO=4 and pp.ID_PRODUTO=c.id), 0) as preco4,
+
+                    coalesce((select ep.QTD_ESTOQUE from ESTOQUE_PRODUTO ep where ep.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and ep.ID_TIPO_ESTOQUE_PRODUTO=1 and ep.ID_PRODUTO=c.id),0) qtd_estoque,
+                    coalesce((select ep.QTD_ESTOQUE from ESTOQUE_PRODUTO ep where ep.ID_ECF_EMPRESA=@idEmpresa_TERMINAL and ep.ID_TIPO_ESTOQUE_PRODUTO=2 and ep.ID_PRODUTO=c.id),0) qtd_estoque2,
+                    COALESCE(c.TAXA_COMISSAO,0) as percentual_comissao, ud.PODE_FRACIONAR as pode_fracionar
+                    FROM produto C
+                    INNER JOIN produto_marca cd ON cd.ID = c.ID_PRODUTO_MARCA
+                    INNER JOIN SUBGRUPO_PRODUTO gc ON gc.ID = c.ID_SUBGRUPO_PRODUTO
+                    INNER JOIN UNIDADE_PRODUTO ud ON ud.ID = c.ID_UNIDADE_PRODUTO
+                    INNER JOIN FORNECEDOR mr ON mr.ID = c.ID_FORNECEDOR
+                    and c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='PRODUTO' and INTEGRADO='N' )";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        produtosL.Add(new
+                        while (reader.Read())
                         {
-                            id_status_produto = reader.GetInt32(reader.GetOrdinal("ID_STATUS_PRODUTO")),
-                            grupo_produto_id = reader.GetInt32(reader.GetOrdinal("grupo_produto_id")),
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
-                            subgrupo_produto = reader.IsDBNull(reader.GetOrdinal("subgrupo_produto")) ? null : reader.GetString(reader.GetOrdinal("subgrupo_produto")),
-                            marca_produto = reader.IsDBNull(reader.GetOrdinal("marca_produto")) ? null : reader.GetString(reader.GetOrdinal("marca_produto")),
-                            unidade = reader.IsDBNull(reader.GetOrdinal("unidade")) ? null : reader.GetString(reader.GetOrdinal("unidade")),
-                            fornecedor = reader.IsDBNull(reader.GetOrdinal("fornecedor")) ? null : reader.GetString(reader.GetOrdinal("fornecedor")),
-                            referencia = reader.IsDBNull(reader.GetOrdinal("referencia")) ? null : reader.GetString(reader.GetOrdinal("referencia")),
-                            gtin = reader.IsDBNull(reader.GetOrdinal("gtin")) ? null : reader.GetString(reader.GetOrdinal("gtin")),
-                            percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao")),
-                            quantidade_minima = reader.GetDecimal(reader.GetOrdinal("quantidade_minima")),
-                            quantidade_maxima = reader.GetDecimal(reader.GetOrdinal("quantidade_maxima")),
-                            cest = reader.IsDBNull(reader.GetOrdinal("cest")) ? null : reader.GetString(reader.GetOrdinal("cest")),
-                            pode_fracionar = reader.IsDBNull(reader.GetOrdinal("pode_fracionar")) ? null : reader.GetString(reader.GetOrdinal("pode_fracionar")),
-                            ncm = reader.IsDBNull(reader.GetOrdinal("ncm")) ? null : reader.GetString(reader.GetOrdinal("ncm")),
-                            vende_store = reader.IsDBNull(reader.GetOrdinal("VENDE_STORE")) ? null : reader.GetString(reader.GetOrdinal("VENDE_STORE")),
-                            produto_destaque = reader.IsDBNull(reader.GetOrdinal("produto_destaque")) ? null : reader.GetString(reader.GetOrdinal("produto_destaque")),
-                            descricao_store = reader.IsDBNull(reader.GetOrdinal("descricao_store")) ? null : reader.GetString(reader.GetOrdinal("descricao_store")),
-                            preco1 = reader.GetDecimal(reader.GetOrdinal("preco1")),
-                            preco2 = reader.GetDecimal(reader.GetOrdinal("preco2")),
-                            qtd_estoque = reader.GetDecimal(reader.GetOrdinal("qtd_estoque")),
-                        });
+                            produtosL.Add(new
+                            {
+                                id_status_produto = reader.GetInt32(reader.GetOrdinal("ID_STATUS_PRODUTO")),
+                                grupo_produto_id = reader.GetInt32(reader.GetOrdinal("grupo_produto_id")),
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
+                                subgrupo_produto = reader.IsDBNull(reader.GetOrdinal("subgrupo_produto")) ? null : reader.GetString(reader.GetOrdinal("subgrupo_produto")),
+                                marca_produto = reader.IsDBNull(reader.GetOrdinal("marca_produto")) ? null : reader.GetString(reader.GetOrdinal("marca_produto")),
+                                unidade = reader.IsDBNull(reader.GetOrdinal("unidade")) ? null : reader.GetString(reader.GetOrdinal("unidade")),
+                                fornecedor = reader.IsDBNull(reader.GetOrdinal("fornecedor")) ? null : reader.GetString(reader.GetOrdinal("fornecedor")),
+                                referencia = reader.IsDBNull(reader.GetOrdinal("referencia")) ? null : reader.GetString(reader.GetOrdinal("referencia")),
+                                gtin = reader.IsDBNull(reader.GetOrdinal("gtin")) ? null : reader.GetString(reader.GetOrdinal("gtin")),
+                                percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao")),
+                                quantidade_minima = reader.GetDecimal(reader.GetOrdinal("quantidade_minima")),
+                                quantidade_maxima = reader.GetDecimal(reader.GetOrdinal("quantidade_maxima")),
+                                cest = reader.IsDBNull(reader.GetOrdinal("cest")) ? null : reader.GetString(reader.GetOrdinal("cest")),
+                                pode_fracionar = reader.IsDBNull(reader.GetOrdinal("pode_fracionar")) ? null : reader.GetString(reader.GetOrdinal("pode_fracionar")),
+                                ncm = reader.IsDBNull(reader.GetOrdinal("ncm")) ? null : reader.GetString(reader.GetOrdinal("ncm")),
+                                vende_store = reader.IsDBNull(reader.GetOrdinal("VENDE_STORE")) ? null : reader.GetString(reader.GetOrdinal("VENDE_STORE")),
+                                produto_destaque = reader.IsDBNull(reader.GetOrdinal("produto_destaque")) ? null : reader.GetString(reader.GetOrdinal("produto_destaque")),
+                                descricao_store = reader.IsDBNull(reader.GetOrdinal("descricao_store")) ? null : reader.GetString(reader.GetOrdinal("descricao_store")),
+                                preco1 = reader.GetDecimal(reader.GetOrdinal("preco1")),
+                                preco2 = reader.GetDecimal(reader.GetOrdinal("preco2")),
+                                qtd_estoque = reader.GetDecimal(reader.GetOrdinal("qtd_estoque")),
+                            });
+                        }
                     }
                 }
             }
-
             return produtosL.ToArray();
         }
 
@@ -1962,29 +2083,35 @@ namespace LsiGestor
         {
             var qtdEstoques = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                select ID_PRODUTO, QTD_ESTOQUE from estoque_produto e
-                where ID_PRODUTO in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='ESTOQUE_PRODUTO' and INTEGRADO='N' )
-                and e.ID_ECF_EMPRESA=@idEmpresa_TERMINAL", connection);
 
-
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    select ID_PRODUTO, QTD_ESTOQUE from estoque_produto e
+                    where ID_PRODUTO in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='ESTOQUE_PRODUTO' and INTEGRADO='N' )
+                    and e.ID_ECF_EMPRESA=@idEmpresa_TERMINAL";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        qtdEstoques.Add(new
+                        while (reader.Read())
                         {
-                            id_produto = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
-                            qtd_estoque = reader.GetDecimal(reader.GetOrdinal("QTD_ESTOQUE")),
-                        });
+                            qtdEstoques.Add(new
+                            {
+                                id_produto = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
+                                qtd_estoque = reader.GetDecimal(reader.GetOrdinal("QTD_ESTOQUE")),
+                            });
+                        }
                     }
                 }
             }
-
             return qtdEstoques.ToArray();
         }
 
@@ -1992,10 +2119,13 @@ namespace LsiGestor
         {
             var promocoes = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
+
+                using (DbCommand command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
 			    SELECT
 				     ID, DESCRICAO, DATA_INICIAL, DATA_FINAL,
 				     STATUS, ID_EMPRESA, ID_TIPO_PRECO_PRODUTO
@@ -2003,42 +2133,46 @@ namespace LsiGestor
 				     CAMPANHA_PROMOCAO_PRODUTO
 			    WHERE 
 			         ID_EMPRESA =@idEmpresa_TERMINAL
-                and ID in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='CAMPANHA_PROMOCAO_PRODUTO' and INTEGRADO='N' )", connection);
+                and ID in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='CAMPANHA_PROMOCAO_PRODUTO' and INTEGRADO='N' )";
 
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
-                using (var reader = command.ExecuteReader())
-                {
-                    while (reader.Read())
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        promocoes.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("ID")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("DESCRICAO"))
-                        ? null
-                        : reader.GetString(reader.GetOrdinal("DESCRICAO")),
+                            promocoes.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("ID")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("DESCRICAO"))
+                            ? null
+                            : reader.GetString(reader.GetOrdinal("DESCRICAO")),
 
-                            data_inicial = reader.IsDBNull(reader.GetOrdinal("DATA_INICIAL"))
-                        ? null
-                        : reader.GetDateTime(reader.GetOrdinal("DATA_INICIAL")).ToString("yyyy-MM-dd HH:mm:ss"),
+                                data_inicial = reader.IsDBNull(reader.GetOrdinal("DATA_INICIAL"))
+                            ? null
+                            : reader.GetDateTime(reader.GetOrdinal("DATA_INICIAL")).ToString("yyyy-MM-dd HH:mm:ss"),
 
-                            data_final = reader.IsDBNull(reader.GetOrdinal("DATA_FINAL"))
-                        ? null
-                        : reader.GetDateTime(reader.GetOrdinal("DATA_FINAL")).ToString("yyyy-MM-dd HH:mm:ss"),
+                                data_final = reader.IsDBNull(reader.GetOrdinal("DATA_FINAL"))
+                            ? null
+                            : reader.GetDateTime(reader.GetOrdinal("DATA_FINAL")).ToString("yyyy-MM-dd HH:mm:ss"),
 
-                            empresa_id = reader.GetInt32(reader.GetOrdinal("ID_EMPRESA")),
+                                empresa_id = reader.GetInt32(reader.GetOrdinal("ID_EMPRESA")),
 
-                            status = reader.IsDBNull(reader.GetOrdinal("STATUS"))
-                        ? null
-                        : reader.GetString(reader.GetOrdinal("STATUS")),
+                                status = reader.IsDBNull(reader.GetOrdinal("STATUS"))
+                            ? null
+                            : reader.GetString(reader.GetOrdinal("STATUS")),
 
-                            id_tipo_preco_produto = reader.IsDBNull(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
-                        ? (int?)null
-                        : reader.GetInt32(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
-                        });
+                                id_tipo_preco_produto = reader.IsDBNull(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
+                            ? (int?)null
+                            : reader.GetInt32(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
+                            });
+                        }
                     }
                 }
             }
-
             return promocoes.ToArray();
         }
 
@@ -2046,47 +2180,54 @@ namespace LsiGestor
         {
             var produtopromos = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT PP.ID,
-                    COALESCE(PP.QUANTIDADE_EM_PROMOCAO, 0) AS QUANTIDADE_EM_PROMOCAO, 
-                    COALESCE(PP.QUANTIDADE_MAXIMA_CLIENTE, 0) AS QUANTIDADE_MAXIMA_CLIENTE,
-                    PP.VALOR, 
-                    COALESCE(PP.qtdja_vendida, 0) AS qtda_vendida, 
-				    COALESCE(pp.ID_TIPO_ESTOQUE_PRODUTO,0) as id_tipo_estoque_produto,
-                    pd.VALOR_PRODUTO AS VALOR_VENDA, pd.ID_PRODUTO,C.ID as id_campanha_promo_prod
-                FROM PRODUTO_PROMOCAO PP
-                INNER JOIN CAMPANHA_PROMOCAO_PRODUTO C ON C.ID = PP.ID_CAMPANHA_PROMO_PROD
-                INNER JOIN PRECO_PRODUTO pd ON pd.ID_PRODUTO = PP.ID_PRODUTO 
-                    AND pd.ID_ECF_EMPRESA = C.id_empresa 
-                    AND pd.ID_TIPO_PRECO_PRODUTO = C.ID_TIPO_PRECO_PRODUTO
-                WHERE 
-                    C.id_empresa = @idEmpresa_TERMINAL
-                and PP.ID in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='PRODUTO_PROMOCAO' and INTEGRADO='N' )", connection);
 
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT PP.ID,
+                        COALESCE(PP.QUANTIDADE_EM_PROMOCAO, 0) AS QUANTIDADE_EM_PROMOCAO, 
+                        COALESCE(PP.QUANTIDADE_MAXIMA_CLIENTE, 0) AS QUANTIDADE_MAXIMA_CLIENTE,
+                        PP.VALOR, 
+                        COALESCE(PP.qtdja_vendida, 0) AS qtda_vendida, 
+				        COALESCE(pp.ID_TIPO_ESTOQUE_PRODUTO,0) as id_tipo_estoque_produto,
+                        pd.VALOR_PRODUTO AS VALOR_VENDA, pd.ID_PRODUTO,C.ID as id_campanha_promo_prod
+                    FROM PRODUTO_PROMOCAO PP
+                    INNER JOIN CAMPANHA_PROMOCAO_PRODUTO C ON C.ID = PP.ID_CAMPANHA_PROMO_PROD
+                    INNER JOIN PRECO_PRODUTO pd ON pd.ID_PRODUTO = PP.ID_PRODUTO 
+                        AND pd.ID_ECF_EMPRESA = C.id_empresa 
+                        AND pd.ID_TIPO_PRECO_PRODUTO = C.ID_TIPO_PRECO_PRODUTO
+                    WHERE 
+                        C.id_empresa = @idEmpresa_TERMINAL
+                    and PP.ID in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='PRODUTO_PROMOCAO' and INTEGRADO='N' )";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        produtopromos.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("ID")),
-                            produto_id = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
-                            quantidade_em_promocao = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_EM_PROMOCAO")),
-                            quantidade_maxima_cliente = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_MAXIMA_CLIENTE")),
-                            valor = reader.GetDecimal(reader.GetOrdinal("VALOR")),
-                            id_campanha_promo_prod = reader.GetInt32(reader.GetOrdinal("id_campanha_promo_prod")),
-                            qtda_vendida = reader.GetDecimal(reader.GetOrdinal("qtda_vendida")),
-                            id_tipo_estoque_produto = reader.GetInt32(reader.GetOrdinal("id_tipo_estoque_produto")),
-                            valor_venda = reader.GetDecimal(reader.GetOrdinal("VALOR_VENDA")),
-                        });
+                            produtopromos.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("ID")),
+                                produto_id = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
+                                quantidade_em_promocao = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_EM_PROMOCAO")),
+                                quantidade_maxima_cliente = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_MAXIMA_CLIENTE")),
+                                valor = reader.GetDecimal(reader.GetOrdinal("VALOR")),
+                                id_campanha_promo_prod = reader.GetInt32(reader.GetOrdinal("id_campanha_promo_prod")),
+                                qtda_vendida = reader.GetDecimal(reader.GetOrdinal("qtda_vendida")),
+                                id_tipo_estoque_produto = reader.GetInt32(reader.GetOrdinal("id_tipo_estoque_produto")),
+                                valor_venda = reader.GetDecimal(reader.GetOrdinal("VALOR_VENDA")),
+                            });
+                        }
                     }
                 }
             }
-
             return produtopromos.ToArray();
         }
 
@@ -2094,19 +2235,21 @@ namespace LsiGestor
         {
             var clientes = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
+
+                DbCommand command = connection.CreateCommand();
+                command.CommandText = @"
                     SELECT c.id, c.nome AS razao_social, c.cpf_cnpj AS cnpj, c.fantasia AS nome_fantasia,
                     gc.NOME AS grupo_cliente, cd.NOMECIDADE AS cidade, c.bairro, c.complemento, c.data_nascimento
                     FROM cliente c
                     INNER JOIN cidade cd ON cd.IDCIDADE = c.ID_CIDADE
                     INNER JOIN GRUPO_CLIENTE gc ON gc.id = c.ID_GRUPO_CLIENTE
                     WHERE c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='Cliente' and INTEGRADO='N')
-                    ", connection);
+                    ";
 
-                using (var reader = command.ExecuteReader())
+                using (DbDataReader reader = command.ExecuteReader())
                 {
                     while (reader.Read())
                     {
@@ -2133,17 +2276,19 @@ namespace LsiGestor
         {
             var formaPagamento = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
+
+                DbCommand command = connection.CreateCommand();
+                command.CommandText = @"
                 select c.id, c.DESCRICAO as descricao, c.ID_GRUPO_PAGAMENTO as grupo_pagamento_id,
                 COALESCE(c.TAXA_COMISSAO,0) as percentual_comissao
                 from ECF_TIPO_PAGAMENTO c
                 WHERE c.id in (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='ECF_TIPO_PAGAMENTO' and INTEGRADO='n')
-                ", connection);
+                ";
 
-                using (var reader = command.ExecuteReader())
+                using (DbDataReader reader = command.ExecuteReader())
                 {
                     while (reader.Read())
                     {
@@ -2165,13 +2310,15 @@ namespace LsiGestor
         {
             var grupoPagamento = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                select ID, DESCRICAO from GRUPO_PAGAMENTO", connection);
 
-                using (var reader = command.ExecuteReader())
+                DbCommand command = connection.CreateCommand();
+                command.CommandText = @"
+                select ID, DESCRICAO from GRUPO_PAGAMENTO";
+
+                using (DbDataReader reader = command.ExecuteReader())
                 {
                     while (reader.Read())
                     {
@@ -2191,17 +2338,19 @@ namespace LsiGestor
         {
             var pdvs = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
+
+                DbCommand command = connection.CreateCommand();
+                command.CommandText = @"
                 select c.id, c.DESCRICAO as descricao
                 from TERMINAL_PDV c
                 WHERE c.id in
                 (SELECT ID_TABELA FROM LOG_EXPORT_CLOUD WHERE TABELA='TERMINAL_PDV' and INTEGRADO='N')
-                ", connection);
+                ";
 
-                using (var reader = command.ExecuteReader())
+                using (DbDataReader reader = command.ExecuteReader())
                 {
                     while (reader.Read())
                     {
@@ -2221,11 +2370,8 @@ namespace LsiGestor
         private dynamic[] GetNotaFiscalCabecalhoFromDatabase()
         {
             var notasFiscais = new List<dynamic>();
-            // Vari�veis para armazenar os diret�rios
-            string diretorioNFE = "";
-            string diretorioNFCE = "";
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
 
@@ -2271,12 +2417,17 @@ namespace LsiGestor
                 AND c.ID_SITUACAO IN (8, 9)
                 AND c.INTEGRADO = 'N' 
                 AND c.id_empresa = @idEmpresa_TERMINAL";
-
-                using (var commandNotas = new SqlCommand(queryNotasFiscais, connection))
                 //, COALESCE(c.XML_NUVEM, '') AS XML_NUVEM
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    commandNotas.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
-                    using (var reader = commandNotas.ExecuteReader())
+                    command.CommandText = queryNotasFiscais;
+
+                    DbParameter param = command.CreateParameter();
+                    param.ParameterName = "@idEmpresa_TERMINAL";
+                    param.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(param);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
                         while (reader.Read())
                         {
@@ -2326,55 +2477,73 @@ namespace LsiGestor
         {
             var parcelas = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                 SELECT
-                     v.ID, v.HISTORICO, v.ID_TIPO_PAGAMENTO, v.ID_PLANO_CONTA, v.ID_PESSOA, v.TIPO, v.NUMERO_DOCUMENTO,
-                     v.VALOR_TOTAL, v.DATA_LANCAMENTO, v.PRIMEIRO_VENCIMENTO, v.QUANTIDADE_PARCELA, v.ID_MOVIMENTACAO,
-                     v.ID_EMPRESA, v.INTERVALO_VENCIMENTO, v.ID_CENTRO_CUSTO, v.STATUS_PREVISAO, v.FIXA_VENCIMENTO,
-                     v.ID_TERMINAL_PDV, v.BOLETO_IMPRESSO, v.STBAIXA_RETORNO, v.STATUS_ESTORNO
-                 FROM 
-                     CONTAS_PARCELAS v
-                 INNER JOIN
-                     CONTAS_DETALHE cd ON cd.ID_CONTAS_PARCELAS = v.ID
-                 WHERE 
-                     v.ID_EMPRESA = @idEmpresa
-                     AND cd.ID_SITUACAO_PARCELA IN (1, 2)
-                     AND v.DATA_LANCAMENTO >= '2025-06-01 00:00:00.000'", connection);
 
-                command.Parameters.AddWithValue("@idEmpresa", idEmpresa_TERMINAL);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                SELECT
+                    v.ID, v.HISTORICO, v.ID_TIPO_PAGAMENTO, v.ID_PLANO_CONTA, 
+                    v.ID_PESSOA, v.TIPO, v.NUMERO_DOCUMENTO,
+                    v.VALOR_TOTAL, v.DATA_LANCAMENTO, v.PRIMEIRO_VENCIMENTO, 
+                    v.QUANTIDADE_PARCELA, v.ID_MOVIMENTACAO,
+                    v.ID_EMPRESA, v.INTERVALO_VENCIMENTO, v.ID_CENTRO_CUSTO, 
+                    v.STATUS_PREVISAO, v.FIXA_VENCIMENTO,
+                    v.ID_TERMINAL_PDV, v.BOLETO_IMPRESSO, 
+                    v.STBAIXA_RETORNO, v.STATUS_ESTORNO
+                FROM CONTAS_PARCELAS v
+                INNER JOIN CONTAS_DETALHE cd 
+                    ON cd.ID_CONTAS_PARCELAS = v.ID
+                WHERE 
+                    v.ID_EMPRESA = @idEmpresa
+                    AND cd.ID_SITUACAO_PARCELA IN (1, 2)
+                    AND v.DATA_LANCAMENTO >= @dataInicial";
+
+                    // parâmetro empresa
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    // parâmetro data
+                    var pData = command.CreateParameter();
+                    pData.ParameterName = "@dataInicial";
+                    pData.Value = new DateTime(2025, 6, 1);
+                    pData.DbType = DbType.DateTime;
+                    command.Parameters.Add(pData);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        parcelas.Add(new
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            idOriginal = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            historico = reader["HISTORICO"] as string,
-                            id_tipo_pagamento = reader["ID_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_TIPO_PAGAMENTO"]) : (int?)null,
-                            id_plano_conta = reader["ID_PLANO_CONTA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PLANO_CONTA"]) : 0,
-                            id_pessoa = reader["ID_PESSOA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PESSOA"]) : 0,
-                            tipo = reader["TIPO"] as string,
-                            numero_documento = reader["NUMERO_DOCUMENTO"] as string,
-                            valor_total = reader["VALOR_TOTAL"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_TOTAL"]) : 0m,
-                            data_lancamento = reader["DATA_LANCAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_LANCAMENTO"]) : (DateTime?)null,
-                            primeiro_vencimento = reader["PRIMEIRO_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["PRIMEIRO_VENCIMENTO"]) : (DateTime?)null,
-                            quantidade_parcela = reader["QUANTIDADE_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["QUANTIDADE_PARCELA"]) : (int?)null,
-                            id_movimentacao = reader["ID_MOVIMENTACAO"] != DBNull.Value ? Convert.ToInt32(reader["ID_MOVIMENTACAO"]) : 0,
-                            id_empresa = reader["ID_EMPRESA"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA"]) : 0,
-                            intervalo_vencimento = reader["INTERVALO_VENCIMENTO"] != DBNull.Value ? Convert.ToInt32(reader["INTERVALO_VENCIMENTO"]) : (int?)null,
-                            id_centro_custo = reader["ID_CENTRO_CUSTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_CENTRO_CUSTO"]) : 0,
-                            status_previsao = reader["STATUS_PREVISAO"] as string,
-                            fixa_vencimento = reader["FIXA_VENCIMENTO"] as string,
-                            id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
-                            boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
-                            stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
-                            status_estorno = reader["STATUS_ESTORNO"] as string
-                        });
+                            parcelas.Add(new
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                idOriginal = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                historico = reader["HISTORICO"]?.ToString(),
+                                id_tipo_pagamento = reader["ID_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_TIPO_PAGAMENTO"]) : (int?)null,
+                                id_plano_conta = reader["ID_PLANO_CONTA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PLANO_CONTA"]) : 0,
+                                id_pessoa = reader["ID_PESSOA"] != DBNull.Value ? Convert.ToInt32(reader["ID_PESSOA"]) : 0,
+                                tipo = reader["TIPO"]?.ToString(),
+                                numero_documento = reader["NUMERO_DOCUMENTO"]?.ToString(),
+                                valor_total = reader["VALOR_TOTAL"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_TOTAL"]) : 0m,
+                                data_lancamento = reader["DATA_LANCAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_LANCAMENTO"]) : (DateTime?)null,
+                                primeiro_vencimento = reader["PRIMEIRO_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["PRIMEIRO_VENCIMENTO"]) : (DateTime?)null,
+                                quantidade_parcela = reader["QUANTIDADE_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["QUANTIDADE_PARCELA"]) : (int?)null,
+                                id_movimentacao = reader["ID_MOVIMENTACAO"] != DBNull.Value ? Convert.ToInt32(reader["ID_MOVIMENTACAO"]) : 0,
+                                id_empresa = reader["ID_EMPRESA"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA"]) : 0,
+                                intervalo_vencimento = reader["INTERVALO_VENCIMENTO"] != DBNull.Value ? Convert.ToInt32(reader["INTERVALO_VENCIMENTO"]) : (int?)null,
+                                id_centro_custo = reader["ID_CENTRO_CUSTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_CENTRO_CUSTO"]) : 0,
+                                status_previsao = reader["STATUS_PREVISAO"]?.ToString(),
+                                fixa_vencimento = reader["FIXA_VENCIMENTO"]?.ToString(),
+                                id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
+                                boleto_impresso = reader["BOLETO_IMPRESSO"]?.ToString(),
+                                stbaixa_retorno = reader["STBAIXA_RETORNO"]?.ToString(),
+                                status_estorno = reader["STATUS_ESTORNO"]?.ToString()
+                            });
+                        }
                     }
                 }
             }
@@ -2385,165 +2554,181 @@ namespace LsiGestor
         {
             var detalhes = new List<DetalheParcela>();
 
-            using (var connection = new SqlConnection(connectionString))
+
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT *
-            FROM CONTAS_DETALHE
-            WHERE ID_CONTAS_PARCELAS = @parcelaID", connection);
 
-                command.Parameters.AddWithValue("@parcelaID", parcelaID);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT *
+                    FROM CONTAS_DETALHE
+                    WHERE ID_CONTAS_PARCELAS = @parcelaID";
+
+                    var pParcela = command.CreateParameter();
+                    pParcela.ParameterName = "@parcelaID";
+                    pParcela.Value = parcelaID;
+                    command.Parameters.Add(pParcela);
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        detalhes.Add(new DetalheParcela
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            id_contas_parcelas = reader["ID_CONTAS_PARCELAS"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_PARCELAS"]) : 0,
-                            data_vencimento = reader["DATA_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_VENCIMENTO"]) : (DateTime?)null,
-                            data_pagamento = reader["DATA_PAGAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_PAGAMENTO"]) : (DateTime?)null,
-                            numero_parcela = reader["NUMERO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["NUMERO_PARCELA"]) : (int?)null,
-                            valor = reader["VALOR"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR"]) : 0m,
-                            taxa_juros = reader["TAXA_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_JUROS"]) : 0m,
-                            taxa_multa = reader["TAXA_MULTA"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_MULTA"]) : 0m,
-                            taxa_desconto = reader["TAXA_DESCONTO"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_DESCONTO"]) : 0m,
-                            valor_juros = reader["VALOR_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_JUROS"]) : 0m,
-                            id_situacao_parcela = reader["ID_SITUACAO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["ID_SITUACAO_PARCELA"]) : 0,
-                            valor_pago = reader["VALOR_PAGO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGO"]) : 0m,
-                            id_empresa_pago = reader["ID_EMPRESA_PAGO"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA_PAGO"]) : 0,
-                            boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
-                            stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
-                            nosso_numero = reader["NOSSO_NUMERO"] != DBNull.Value ? Convert.ToInt32(reader["NOSSO_NUMERO"]) : 0,
-                            status_estorno = reader["STATUS_ESTORNO"] as string,
-                            status_previsao = reader["STATUS_PREVISAO"] as string
-                        });
+                            detalhes.Add(new DetalheParcela
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                id_contas_parcelas = reader["ID_CONTAS_PARCELAS"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_PARCELAS"]) : 0,
+                                data_vencimento = reader["DATA_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_VENCIMENTO"]) : (DateTime?)null,
+                                data_pagamento = reader["DATA_PAGAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_PAGAMENTO"]) : (DateTime?)null,
+                                numero_parcela = reader["NUMERO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["NUMERO_PARCELA"]) : (int?)null,
+                                valor = reader["VALOR"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR"]) : 0m,
+                                taxa_juros = reader["TAXA_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_JUROS"]) : 0m,
+                                taxa_multa = reader["TAXA_MULTA"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_MULTA"]) : 0m,
+                                taxa_desconto = reader["TAXA_DESCONTO"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_DESCONTO"]) : 0m,
+                                valor_juros = reader["VALOR_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_JUROS"]) : 0m,
+                                id_situacao_parcela = reader["ID_SITUACAO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["ID_SITUACAO_PARCELA"]) : 0,
+                                valor_pago = reader["VALOR_PAGO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGO"]) : 0m,
+                                id_empresa_pago = reader["ID_EMPRESA_PAGO"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA_PAGO"]) : 0,
+                                boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
+                                stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
+                                nosso_numero = reader["NOSSO_NUMERO"] != DBNull.Value ? Convert.ToInt32(reader["NOSSO_NUMERO"]) : 0,
+                                status_estorno = reader["STATUS_ESTORNO"] as string,
+                                status_previsao = reader["STATUS_PREVISAO"] as string
+                            });
+                        }
                     }
                 }
             }
-
             return detalhes;
         }
         private List<DetalheParcela> GetParcelasDetalhes2()
         {
             var detalhes = new List<DetalheParcela>();
-
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT *
-            FROM CONTAS_DETALHE cd
-            INNER JOIN LOG_EXPORT_REPLI v ON v.ID_TABELA = cd.ID
-            WHERE v.INTEGRADO = 'N' and v.TABELA = 'CONTAS_DETALHE'", connection);
 
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT *
+                    FROM CONTAS_DETALHE cd
+                    INNER JOIN LOG_EXPORT_REPLI v ON v.ID_TABELA = cd.ID
+                    WHERE v.INTEGRADO = 'N' and v.TABELA = 'CONTAS_DETALHE'";
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        detalhes.Add(new DetalheParcela
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            id_contas_parcelas = reader["ID_CONTAS_PARCELAS"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_PARCELAS"]) : 0,
-                            data_vencimento = reader["DATA_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_VENCIMENTO"]) : (DateTime?)null,
-                            data_pagamento = reader["DATA_PAGAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_PAGAMENTO"]) : (DateTime?)null,
-                            numero_parcela = reader["NUMERO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["NUMERO_PARCELA"]) : (int?)null,
-                            valor = reader["VALOR"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR"]) : 0m,
-                            taxa_juros = reader["TAXA_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_JUROS"]) : 0m,
-                            taxa_multa = reader["TAXA_MULTA"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_MULTA"]) : 0m,
-                            taxa_desconto = reader["TAXA_DESCONTO"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_DESCONTO"]) : 0m,
-                            valor_juros = reader["VALOR_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_JUROS"]) : 0m,
-                            id_situacao_parcela = reader["ID_SITUACAO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["ID_SITUACAO_PARCELA"]) : 0,
-                            valor_pago = reader["VALOR_PAGO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGO"]) : 0m,
-                            id_empresa_pago = reader["ID_EMPRESA_PAGO"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA_PAGO"]) : 0,
-                            boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
-                            stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
-                            nosso_numero = reader["NOSSO_NUMERO"] != DBNull.Value ? Convert.ToInt32(reader["NOSSO_NUMERO"]) : 0,
-                            status_estorno = reader["STATUS_ESTORNO"] as string,
-                            status_previsao = reader["STATUS_PREVISAO"] as string
-                        });
+                            detalhes.Add(new DetalheParcela
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                id_contas_parcelas = reader["ID_CONTAS_PARCELAS"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_PARCELAS"]) : 0,
+                                data_vencimento = reader["DATA_VENCIMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_VENCIMENTO"]) : (DateTime?)null,
+                                data_pagamento = reader["DATA_PAGAMENTO"] != DBNull.Value ? Convert.ToDateTime(reader["DATA_PAGAMENTO"]) : (DateTime?)null,
+                                numero_parcela = reader["NUMERO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["NUMERO_PARCELA"]) : (int?)null,
+                                valor = reader["VALOR"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR"]) : 0m,
+                                taxa_juros = reader["TAXA_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_JUROS"]) : 0m,
+                                taxa_multa = reader["TAXA_MULTA"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_MULTA"]) : 0m,
+                                taxa_desconto = reader["TAXA_DESCONTO"] != DBNull.Value ? Convert.ToDecimal(reader["TAXA_DESCONTO"]) : 0m,
+                                valor_juros = reader["VALOR_JUROS"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_JUROS"]) : 0m,
+                                id_situacao_parcela = reader["ID_SITUACAO_PARCELA"] != DBNull.Value ? Convert.ToInt32(reader["ID_SITUACAO_PARCELA"]) : 0,
+                                valor_pago = reader["VALOR_PAGO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGO"]) : 0m,
+                                id_empresa_pago = reader["ID_EMPRESA_PAGO"] != DBNull.Value ? Convert.ToInt32(reader["ID_EMPRESA_PAGO"]) : 0,
+                                boleto_impresso = reader["BOLETO_IMPRESSO"] as string,
+                                stbaixa_retorno = reader["STBAIXA_RETORNO"] as string,
+                                nosso_numero = reader["NOSSO_NUMERO"] != DBNull.Value ? Convert.ToInt32(reader["NOSSO_NUMERO"]) : 0,
+                                status_estorno = reader["STATUS_ESTORNO"] as string,
+                                status_previsao = reader["STATUS_PREVISAO"] as string
+                            });
+                        }
                     }
                 }
             }
-
             return detalhes;
         }
         private List<PagamentoParcela> GetParcelasPagamentos(int detalheId)
         {
             var pagamentos = new List<PagamentoParcela>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT cp.*
-            FROM CONTAS_PAGAMENTO cp
-            INNER JOIN CONTAS_DETALHE cd ON cd.ID = cp.ID_CONTAS_DETALHES
-            WHERE cd.ID_CONTAS_PARCELAS = @detalheId", connection);
 
-                command.Parameters.AddWithValue("@detalheId", detalheId);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT cp.*
+                    FROM CONTAS_PAGAMENTO cp
+                    INNER JOIN CONTAS_DETALHE cd ON cd.ID = cp.ID_CONTAS_DETALHES
+                    WHERE cd.ID_CONTAS_PARCELAS = @detalheId";
+
+                    var pDetalhe = command.CreateParameter();
+                    pDetalhe.ParameterName = "@detalheId";
+                    pDetalhe.Value = detalheId;
+                    command.Parameters.Add(pDetalhe);
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        pagamentos.Add(new PagamentoParcela
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            id_contas_detalhes = reader["ID_CONTAS_DETALHES"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_DETALHES"]) : 0,
-                            id_ecf_tipo_pagamento = reader["ID_ECF_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_ECF_TIPO_PAGAMENTO"]) : 0,
-                            valor_pagamento = reader["VALOR_PAGAMENTO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGAMENTO"]) : 0m,
-                            data_estorno = reader["DATA_ESTORNO"] != DBNull.Value ? (DateTime?)Convert.ToDateTime(reader["DATA_ESTORNO"]) : null,
-                            status_estorno = reader["STATUS_ESTORNO"] as string,
-                            id_original = reader["ID_ORIGINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_ORIGINAL"]) : null,
-                            id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
-                            tipo_baixa = reader["TIPO_BAIXA"] as string,
-                            id_cpag_terminal = reader["ID_CPAG_TERMINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_CPAG_TERMINAL"]) : null,
-                            id_conta_bancaria = reader["ID_CONTA_BANCARIA"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTA_BANCARIA"]) : 0
-                        });
+                            pagamentos.Add(new PagamentoParcela
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                id_contas_detalhes = reader["ID_CONTAS_DETALHES"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_DETALHES"]) : 0,
+                                id_ecf_tipo_pagamento = reader["ID_ECF_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_ECF_TIPO_PAGAMENTO"]) : 0,
+                                valor_pagamento = reader["VALOR_PAGAMENTO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGAMENTO"]) : 0m,
+                                data_estorno = reader["DATA_ESTORNO"] != DBNull.Value ? (DateTime?)Convert.ToDateTime(reader["DATA_ESTORNO"]) : null,
+                                status_estorno = reader["STATUS_ESTORNO"] as string,
+                                id_original = reader["ID_ORIGINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_ORIGINAL"]) : null,
+                                id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
+                                tipo_baixa = reader["TIPO_BAIXA"] as string,
+                                id_cpag_terminal = reader["ID_CPAG_TERMINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_CPAG_TERMINAL"]) : null,
+                                id_conta_bancaria = reader["ID_CONTA_BANCARIA"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTA_BANCARIA"]) : 0
+                            });
+                        }
                     }
                 }
             }
-
             return pagamentos;
         }
         private List<PagamentoParcela> GetParcelasPagamentos2()
         {
             var pagamentos = new List<PagamentoParcela>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT cp.*
-            FROM CONTAS_PAGAMENTO cp
-            INNER JOIN LOG_EXPORT_REPLI v ON v.ID_TABELA = cp.ID
-            WHERE v.INTEGRADO = 'N' and v.TABELA = 'CONTAS_PAGAMENTO'", connection);
 
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT cp.*
+                    FROM CONTAS_PAGAMENTO cp
+                    INNER JOIN LOG_EXPORT_REPLI v ON v.ID_TABELA = cp.ID
+                    WHERE v.INTEGRADO = 'N' and v.TABELA = 'CONTAS_PAGAMENTO'";
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        pagamentos.Add(new PagamentoParcela
+                        while (reader.Read())
                         {
-                            id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
-                            id_contas_detalhes = reader["ID_CONTAS_DETALHES"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_DETALHES"]) : 0,
-                            id_ecf_tipo_pagamento = reader["ID_ECF_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_ECF_TIPO_PAGAMENTO"]) : 0,
-                            valor_pagamento = reader["VALOR_PAGAMENTO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGAMENTO"]) : 0m,
-                            data_estorno = reader["DATA_ESTORNO"] != DBNull.Value ? (DateTime?)Convert.ToDateTime(reader["DATA_ESTORNO"]) : null,
-                            status_estorno = reader["STATUS_ESTORNO"] as string,
-                            id_original = reader["ID_ORIGINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_ORIGINAL"]) : null,
-                            id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
-                            tipo_baixa = reader["TIPO_BAIXA"] as string,
-                            id_cpag_terminal = reader["ID_CPAG_TERMINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_CPAG_TERMINAL"]) : null,
-                            id_conta_bancaria = reader["ID_CONTA_BANCARIA"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTA_BANCARIA"]) : 0
-                        });
+                            pagamentos.Add(new PagamentoParcela
+                            {
+                                id = reader["ID"] != DBNull.Value ? Convert.ToInt32(reader["ID"]) : 0,
+                                id_contas_detalhes = reader["ID_CONTAS_DETALHES"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTAS_DETALHES"]) : 0,
+                                id_ecf_tipo_pagamento = reader["ID_ECF_TIPO_PAGAMENTO"] != DBNull.Value ? Convert.ToInt32(reader["ID_ECF_TIPO_PAGAMENTO"]) : 0,
+                                valor_pagamento = reader["VALOR_PAGAMENTO"] != DBNull.Value ? Convert.ToDecimal(reader["VALOR_PAGAMENTO"]) : 0m,
+                                data_estorno = reader["DATA_ESTORNO"] != DBNull.Value ? (DateTime?)Convert.ToDateTime(reader["DATA_ESTORNO"]) : null,
+                                status_estorno = reader["STATUS_ESTORNO"] as string,
+                                id_original = reader["ID_ORIGINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_ORIGINAL"]) : null,
+                                id_terminal_pdv = reader["ID_TERMINAL_PDV"] != DBNull.Value ? Convert.ToInt32(reader["ID_TERMINAL_PDV"]) : 0,
+                                tipo_baixa = reader["TIPO_BAIXA"] as string,
+                                id_cpag_terminal = reader["ID_CPAG_TERMINAL"] != DBNull.Value ? (int?)Convert.ToInt32(reader["ID_CPAG_TERMINAL"]) : null,
+                                id_conta_bancaria = reader["ID_CONTA_BANCARIA"] != DBNull.Value ? Convert.ToInt32(reader["ID_CONTA_BANCARIA"]) : 0
+                            });
+                        }
                     }
                 }
             }
-
             return pagamentos;
         }
 
@@ -2552,63 +2737,68 @@ namespace LsiGestor
         {
             var itensDetalhes = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT 
-              d.id,
-                COALESCE(d.ID_PRODUTO,1) AS produto_id,
-                COALESCE(d.VALOR_UNITARIO,0) as valor_unitario,
-                COALESCE(d.CUSTO_PROD, 0) AS valor_custo,
-                COALESCE(d.quantidade,0) as quantidade,
-                COALESCE(d.VALOR_PRODUTOS,0) AS sub_total,
-                COALESCE(d.desconto, 0) AS desconto,
-                COALESCE(d.acrescimo,0) as acrescimo,
-                COALESCE(d.VALOR_TOTAL,0) as valor_total,
-                COALESCE(d.icms, 0) AS valor_pis,
-	            COALESCE(d.pis, 0) AS valor_cofins,
-	            COALESCE(d.cofins, 0) AS valor_ipi,
-	            COALESCE(d.issqn, 0) AS valor_icms,
-	            COALESCE(d.ipi, 0) AS valor_iss,
-                COALESCE(d.cst, 00) AS id_cst_icms,
-                COALESCE(d.CST_PIS, 99) AS id_cst_pis,
-                COALESCE(d.CST_COFINS, 1) AS id_cst_cofins,
-                COALESCE(d.CST_IPI, 00) AS id_cst_ipi,
-	            d.NOME_PRODUTO
-            FROM NOTA_FISCAL_DETALHE d 
-            WHERE d.ID_NF_CABECALHO = @notaFiscalId
-            ", connection);
 
-
-                command.Parameters.AddWithValue("@notaFiscalId", notaFiscalId);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT 
+                      d.id,
+                        COALESCE(d.ID_PRODUTO,1) AS produto_id,
+                        COALESCE(d.VALOR_UNITARIO,0) as valor_unitario,
+                        COALESCE(d.CUSTO_PROD, 0) AS valor_custo,
+                        COALESCE(d.quantidade,0) as quantidade,
+                        COALESCE(d.VALOR_PRODUTOS,0) AS sub_total,
+                        COALESCE(d.desconto, 0) AS desconto,
+                        COALESCE(d.acrescimo,0) as acrescimo,
+                        COALESCE(d.VALOR_TOTAL,0) as valor_total,
+                        COALESCE(d.icms, 0) AS valor_pis,
+	                    COALESCE(d.pis, 0) AS valor_cofins,
+	                    COALESCE(d.cofins, 0) AS valor_ipi,
+	                    COALESCE(d.issqn, 0) AS valor_icms,
+	                    COALESCE(d.ipi, 0) AS valor_iss,
+                        COALESCE(d.cst, 00) AS id_cst_icms,
+                        COALESCE(d.CST_PIS, 99) AS id_cst_pis,
+                        COALESCE(d.CST_COFINS, 1) AS id_cst_cofins,
+                        COALESCE(d.CST_IPI, 00) AS id_cst_ipi,
+	                    d.NOME_PRODUTO
+                    FROM NOTA_FISCAL_DETALHE d 
+                    WHERE d.ID_NF_CABECALHO = @notaFiscalId";
+
+                    var pNota = command.CreateParameter();
+                    pNota.ParameterName = "@notaFiscalId";
+                    pNota.Value = notaFiscalId;
+                    command.Parameters.Add(pNota);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        itensDetalhes.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            produto_id = reader.GetInt32(reader.GetOrdinal("produto_id")),
-                            valor_unitario = reader.GetDecimal(reader.GetOrdinal("valor_unitario")),
-                            nome_produto = reader.GetString(reader.GetOrdinal("nome_produto")),
-                            valor_custo = reader.GetDecimal(reader.GetOrdinal("valor_custo")),
-                            quantidade = reader.GetDecimal(reader.GetOrdinal("quantidade")),
-                            sub_total = reader.GetDecimal(reader.GetOrdinal("sub_total")),
-                            desconto = reader.GetDecimal(reader.GetOrdinal("desconto")),
-                            acrescimo = reader.GetDecimal(reader.GetOrdinal("acrescimo")),
-                            valor_total = reader.GetDecimal(reader.GetOrdinal("valor_total")),
-                            valor_icms = reader.GetDecimal(reader.GetOrdinal("valor_icms")),
-                            valor_pis = reader.GetDecimal(reader.GetOrdinal("valor_pis")),
-                            valor_cofins = reader.GetDecimal(reader.GetOrdinal("valor_cofins")),
-                            valor_ipi = reader.GetDecimal(reader.GetOrdinal("valor_ipi")),
-                            valor_iss = reader.GetDecimal(reader.GetOrdinal("valor_iss")),
-                            id_cst_icms = reader.GetInt32(reader.GetOrdinal("id_cst_icms")),
-                            id_cst_pis = reader.GetInt32(reader.GetOrdinal("id_cst_pis")),
-                            id_cst_cofins = reader.GetInt32(reader.GetOrdinal("id_cst_cofins")),
-                            id_cst_ipi = reader.GetInt32(reader.GetOrdinal("id_cst_ipi"))
-                        });
+                            itensDetalhes.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                produto_id = reader.GetInt32(reader.GetOrdinal("produto_id")),
+                                valor_unitario = reader.GetDecimal(reader.GetOrdinal("valor_unitario")),
+                                nome_produto = reader.GetString(reader.GetOrdinal("nome_produto")),
+                                valor_custo = reader.GetDecimal(reader.GetOrdinal("valor_custo")),
+                                quantidade = reader.GetDecimal(reader.GetOrdinal("quantidade")),
+                                sub_total = reader.GetDecimal(reader.GetOrdinal("sub_total")),
+                                desconto = reader.GetDecimal(reader.GetOrdinal("desconto")),
+                                acrescimo = reader.GetDecimal(reader.GetOrdinal("acrescimo")),
+                                valor_total = reader.GetDecimal(reader.GetOrdinal("valor_total")),
+                                valor_icms = reader.GetDecimal(reader.GetOrdinal("valor_icms")),
+                                valor_pis = reader.GetDecimal(reader.GetOrdinal("valor_pis")),
+                                valor_cofins = reader.GetDecimal(reader.GetOrdinal("valor_cofins")),
+                                valor_ipi = reader.GetDecimal(reader.GetOrdinal("valor_ipi")),
+                                valor_iss = reader.GetDecimal(reader.GetOrdinal("valor_iss")),
+                                id_cst_icms = reader.GetInt32(reader.GetOrdinal("id_cst_icms")),
+                                id_cst_pis = reader.GetInt32(reader.GetOrdinal("id_cst_pis")),
+                                id_cst_cofins = reader.GetInt32(reader.GetOrdinal("id_cst_cofins")),
+                                id_cst_ipi = reader.GetInt32(reader.GetOrdinal("id_cst_ipi"))
+                            });
+                        }
                     }
                 }
             }
@@ -2619,31 +2809,38 @@ namespace LsiGestor
         {
             var pagamentos = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT 
-                p.id,
-                COALESCE(p.ID_ECF_TIPO_PAGAMENTO, 0) AS forma_pagamento_id,
-                COALESCE(p.valor, 0) AS valor
-            FROM NOTA_FISCAL_TIPO_PAGAMENTO p
-            WHERE p.ID_NF_CABECALHO = @notaFiscalId
-            ", connection);
 
-                // Adding the parameter for the query
-                command.Parameters.AddWithValue("@notaFiscalId", notaFiscalId);
-
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT 
+                        p.id,
+                        COALESCE(p.ID_ECF_TIPO_PAGAMENTO, 0) AS forma_pagamento_id,
+                        COALESCE(p.valor, 0) AS valor
+                    FROM NOTA_FISCAL_TIPO_PAGAMENTO p
+                    WHERE p.ID_NF_CABECALHO = @notaFiscalId";
+
+                    // Adding the parameter for the query
+
+                    var pNota = command.CreateParameter();
+                    pNota.ParameterName = "@notaFiscalId";
+                    pNota.Value = notaFiscalId;
+                    command.Parameters.Add(pNota);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        pagamentos.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            forma_pagamento_id = reader.GetInt32(reader.GetOrdinal("forma_pagamento_id")),
-                            valor = reader.GetDecimal(reader.GetOrdinal("valor"))
-                        });
+                            pagamentos.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                forma_pagamento_id = reader.GetInt32(reader.GetOrdinal("forma_pagamento_id")),
+                                valor = reader.GetDecimal(reader.GetOrdinal("valor"))
+                            });
+                        }
                     }
                 }
             }
@@ -2798,9 +2995,9 @@ namespace LsiGestor
                 UpdateResponseTextBox("Upload realizado para Nota Fiscal");
                 textBoxResponse.Clear();
 
-                UpdateResponseTextBox("Aguarde, realizando upload de Parcelas...");
+/*                UpdateResponseTextBox("Aguarde, realizando upload de Parcelas...");
                 await SendParcelas2(idEmpresa_API);
-                UpdateResponseTextBox("Upload realizado para Parcelas");
+                UpdateResponseTextBox("Upload realizado para Parcelas");*/
 
                 // Mensagem final indicando que todos os uploads foram realizados
                 UpdateResponseTextBox("Todos os Uploads Realizados");
@@ -2811,7 +3008,7 @@ namespace LsiGestor
                 UpdateResponseTextBox($"Erro durante o envio: {ex.Message}");
             }
         }
-        private async Task ExecuteSendParcelas()
+/*        private async Task ExecuteSendParcelas()
         {
             textBoxResponse.Clear();
 
@@ -2833,7 +3030,7 @@ namespace LsiGestor
                 // Atualiza a resposta com a mensagem de erro em caso de exce��o
                 UpdateResponseTextBox($"Erro durante o envio: {ex.Message}");
             }
-        }
+        }*/
 
         private async Task SendClientes2(int idEmpresa_API)
         {
@@ -3037,15 +3234,23 @@ namespace LsiGestor
         {
             int batchSize = 50; // Valor padr�o de fallback
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand("SELECT QTD_REG_ENVIO FROM PARAMETROS_GESTOR", connection);
 
-                object result = command.ExecuteScalar();
-                if (result != null && int.TryParse(result.ToString(), out int parsedBatchSize))
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    batchSize = parsedBatchSize;
+                    command.CommandText = "SELECT QTD_REG_ENVIO FROM PARAMETROS_GESTOR";
+
+                    object result = command.ExecuteScalar();
+
+                    if (result != null &&
+                        result != DBNull.Value &&
+                        int.TryParse(result.ToString(), out int parsedBatchSize) &&
+                        parsedBatchSize > 0)
+                    {
+                        batchSize = parsedBatchSize;
+                    }
                 }
             }
 
@@ -3056,44 +3261,47 @@ namespace LsiGestor
         {
             var funcionarios = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT 
-                    c.id, 
-                    c.NOME AS descricao,
-                    c.SENHA AS senha,
-                    CASE 
-                        WHEN EXISTS (SELECT 1 FROM CARGO_FUNCIONARIO cf WHERE cf.ID_FUNCIONARIO = c.id AND cf.ID_CARGO = 2) 
-                        THEN '1' 
-                        ELSE '0' 
-                    END AS caixa,
-                    CASE 
-                        WHEN EXISTS (SELECT 1 FROM CARGO_FUNCIONARIO cf WHERE cf.ID_FUNCIONARIO = c.id AND cf.ID_CARGO = 1) 
-                        THEN '1' 
-                        ELSE '0' 
-                    END AS vendedor,
-                    c.login
-                FROM vw_lst_funcionario_empresa c;", connection);
 
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT 
+                        c.id, 
+                        c.NOME AS descricao,
+                        c.SENHA AS senha,
+                        CASE 
+                            WHEN EXISTS (SELECT 1 FROM CARGO_FUNCIONARIO cf WHERE cf.ID_FUNCIONARIO = c.id AND cf.ID_CARGO = 2) 
+                            THEN '1' 
+                            ELSE '0' 
+                        END AS caixa,
+                        CASE 
+                            WHEN EXISTS (SELECT 1 FROM CARGO_FUNCIONARIO cf WHERE cf.ID_FUNCIONARIO = c.id AND cf.ID_CARGO = 1) 
+                            THEN '1' 
+                            ELSE '0' 
+                        END AS vendedor,
+                        c.login
+                    FROM vw_lst_funcionario_empresa c;";
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        funcionarios.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
-                            vendedor = reader.GetString(reader.GetOrdinal("vendedor")),
-                            caixa = reader.GetString(reader.GetOrdinal("caixa")),
-                            senha = reader.IsDBNull(reader.GetOrdinal("senha")) ? null : reader.GetString(reader.GetOrdinal("senha")),
-                            login = reader.IsDBNull(reader.GetOrdinal("login")) ? null : reader.GetString(reader.GetOrdinal("login"))
-                        });
+                            funcionarios.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("descricao")) ? null : reader.GetString(reader.GetOrdinal("descricao")),
+                                vendedor = reader.GetString(reader.GetOrdinal("vendedor")),
+                                caixa = reader.GetString(reader.GetOrdinal("caixa")),
+                                senha = reader.IsDBNull(reader.GetOrdinal("senha")) ? null : reader.GetString(reader.GetOrdinal("senha")),
+                                login = reader.IsDBNull(reader.GetOrdinal("login")) ? null : reader.GetString(reader.GetOrdinal("login"))
+                            });
+                        }
                     }
                 }
             }
-
             return funcionarios.ToArray();
         }
 
@@ -3101,32 +3309,34 @@ namespace LsiGestor
         {
             var produtos = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-				SELECT
-                    C.id,
-                    c.nome as descricao,
-                    COALESCE(c.TAXA_COMISSAO,0)
-                    as percentual_comissao
-                FROM 
-                    GRUPO_PRODUTO C 
-                ", connection);
-                using (var reader = command.ExecuteReader())
+
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+				    SELECT
+                        C.id,
+                        c.nome as descricao,
+                        COALESCE(c.TAXA_COMISSAO,0)
+                        as percentual_comissao
+                    FROM 
+                        GRUPO_PRODUTO C ";
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        produtos.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("id")),
-                            descricao = reader.GetString(reader.GetOrdinal("descricao")),
-                            percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao"))
-                        });
+                            produtos.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("id")),
+                                descricao = reader.GetString(reader.GetOrdinal("descricao")),
+                                percentual_comissao = reader.GetDecimal(reader.GetOrdinal("percentual_comissao"))
+                            });
+                        }
                     }
                 }
             }
-
             return produtos.ToArray();
         }
 
@@ -3134,103 +3344,120 @@ namespace LsiGestor
         {
             var campanhas = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-            SELECT
-                ID, DESCRICAO, DATA_INICIAL, DATA_FINAL,
-                STATUS, ID_EMPRESA, ID_TIPO_PRECO_PRODUTO
-            FROM
-                CAMPANHA_PROMOCAO_PRODUTO
-            WHERE 
-                ID_EMPRESA = @idEmpresa_TERMINAL
-        ", connection);
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
 
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT
+                        ID, DESCRICAO, DATA_INICIAL, DATA_FINAL,
+                        STATUS, ID_EMPRESA, ID_TIPO_PRECO_PRODUTO
+                    FROM
+                        CAMPANHA_PROMOCAO_PRODUTO
+                    WHERE 
+                        ID_EMPRESA = @idEmpresa_TERMINAL";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (DbDataReader reader = command.ExecuteReader())
                     {
-                        campanhas.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("ID")),
-                            descricao = reader.IsDBNull(reader.GetOrdinal("DESCRICAO"))
-                                ? null
-                                : reader.GetString(reader.GetOrdinal("DESCRICAO")),
+                            campanhas.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("ID")),
+                                descricao = reader.IsDBNull(reader.GetOrdinal("DESCRICAO"))
+                                    ? null
+                                    : reader.GetString(reader.GetOrdinal("DESCRICAO")),
 
-                            data_inicial = reader.IsDBNull(reader.GetOrdinal("DATA_INICIAL"))
-                                ? null
-                                : reader.GetDateTime(reader.GetOrdinal("DATA_INICIAL")).ToString("yyyy-MM-dd HH:mm:ss"),
+                                data_inicial = reader.IsDBNull(reader.GetOrdinal("DATA_INICIAL"))
+                                    ? null
+                                    : reader.GetDateTime(reader.GetOrdinal("DATA_INICIAL")).ToString("yyyy-MM-dd HH:mm:ss"),
 
-                            data_final = reader.IsDBNull(reader.GetOrdinal("DATA_FINAL"))
-                                ? null
-                                : reader.GetDateTime(reader.GetOrdinal("DATA_FINAL")).ToString("yyyy-MM-dd HH:mm:ss"),
+                                data_final = reader.IsDBNull(reader.GetOrdinal("DATA_FINAL"))
+                                    ? null
+                                    : reader.GetDateTime(reader.GetOrdinal("DATA_FINAL")).ToString("yyyy-MM-dd HH:mm:ss"),
 
-                            empresa_id = reader.GetInt32(reader.GetOrdinal("ID_EMPRESA")),
+                                empresa_id = reader.GetInt32(reader.GetOrdinal("ID_EMPRESA")),
 
-                            status = reader.IsDBNull(reader.GetOrdinal("STATUS"))
-                                ? null
-                                : reader.GetString(reader.GetOrdinal("STATUS")),
+                                status = reader.IsDBNull(reader.GetOrdinal("STATUS"))
+                                    ? null
+                                    : reader.GetString(reader.GetOrdinal("STATUS")),
 
-                            id_tipo_preco_produto = reader.IsDBNull(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
-                                ? (int?)null
-                                : reader.GetInt32(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
-                        });
+                                id_tipo_preco_produto = reader.IsDBNull(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
+                                    ? (int?)null
+                                    : reader.GetInt32(reader.GetOrdinal("ID_TIPO_PRECO_PRODUTO"))
+                            });
+                        }
                     }
                 }
-            }
 
+            }
             return campanhas.ToArray();
         }
+
+
 
         private dynamic[] GetProdutoPromocao2FromDatabase() //Produto grupo
         {
             var produtospromos = new List<dynamic>();
 
-            using (var connection = new SqlConnection(connectionString))
+            using (DbConnection connection = CreateConnection())
             {
                 connection.Open();
-                var command = new SqlCommand(@"
-                SELECT PP.ID,
-                    COALESCE(PP.QUANTIDADE_EM_PROMOCAO, 0) AS QUANTIDADE_EM_PROMOCAO, 
-                    COALESCE(PP.QUANTIDADE_MAXIMA_CLIENTE, 0) AS QUANTIDADE_MAXIMA_CLIENTE,
-                    PP.VALOR, 
-                    COALESCE(PP.qtdja_vendida, 0) AS qtda_vendida, 
-				    COALESCE(pp.ID_TIPO_ESTOQUE_PRODUTO,0) as id_tipo_estoque_produto,
-                    pd.VALOR_PRODUTO AS VALOR_VENDA, pd.ID_PRODUTO,C.ID as id_campanha_promo_prod
-                FROM PRODUTO_PROMOCAO PP
-                INNER JOIN CAMPANHA_PROMOCAO_PRODUTO C ON C.ID = PP.ID_CAMPANHA_PROMO_PROD
-                INNER JOIN PRECO_PRODUTO pd ON pd.ID_PRODUTO = PP.ID_PRODUTO 
-                    AND pd.ID_ECF_EMPRESA = C.id_empresa 
-                    AND pd.ID_TIPO_PRECO_PRODUTO = C.ID_TIPO_PRECO_PRODUTO
-                WHERE 
-                    C.id_empresa = @idEmpresa_TERMINAL
-                ", connection);
-                command.Parameters.AddWithValue("@idEmpresa_TERMINAL", idEmpresa_TERMINAL);
 
-                using (var reader = command.ExecuteReader())
+                using (DbCommand command = connection.CreateCommand())
                 {
-                    while (reader.Read())
+                    command.CommandText = @"
+                    SELECT PP.ID,
+                        COALESCE(PP.QUANTIDADE_EM_PROMOCAO, 0) AS QUANTIDADE_EM_PROMOCAO, 
+                        COALESCE(PP.QUANTIDADE_MAXIMA_CLIENTE, 0) AS QUANTIDADE_MAXIMA_CLIENTE,
+                        PP.VALOR, 
+                        COALESCE(PP.qtdja_vendida, 0) AS qtda_vendida, 
+				        COALESCE(pp.ID_TIPO_ESTOQUE_PRODUTO,0) as id_tipo_estoque_produto,
+                        pd.VALOR_PRODUTO AS VALOR_VENDA, pd.ID_PRODUTO,C.ID as id_campanha_promo_prod
+                    FROM PRODUTO_PROMOCAO PP
+                    INNER JOIN CAMPANHA_PROMOCAO_PRODUTO C ON C.ID = PP.ID_CAMPANHA_PROMO_PROD
+                    INNER JOIN PRECO_PRODUTO pd ON pd.ID_PRODUTO = PP.ID_PRODUTO 
+                        AND pd.ID_ECF_EMPRESA = C.id_empresa 
+                        AND pd.ID_TIPO_PRECO_PRODUTO = C.ID_TIPO_PRECO_PRODUTO
+                    WHERE 
+                        C.id_empresa = @idEmpresa_TERMINAL";
+
+                    var pEmpresa = command.CreateParameter();
+                    pEmpresa.ParameterName = "@idEmpresa_TERMINAL";
+                    pEmpresa.Value = idEmpresa_TERMINAL;
+                    command.Parameters.Add(pEmpresa);
+
+                    using (var reader = command.ExecuteReader())
                     {
-                        produtospromos.Add(new
+                        while (reader.Read())
                         {
-                            id = reader.GetInt32(reader.GetOrdinal("ID")),
-                            produto_id = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
-                            quantidade_em_promocao = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_EM_PROMOCAO")),
-                            quantidade_maxima_cliente = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_MAXIMA_CLIENTE")),
-                            valor = reader.GetDecimal(reader.GetOrdinal("VALOR")),
-                            id_campanha_promo_prod = reader.GetInt32(reader.GetOrdinal("id_campanha_promo_prod")),
-                            qtda_vendida = reader.GetDecimal(reader.GetOrdinal("qtda_vendida")),
-                            id_tipo_estoque_produto = reader.GetInt32(reader.GetOrdinal("id_tipo_estoque_produto")),
-                            valor_venda = reader.GetDecimal(reader.GetOrdinal("VALOR_VENDA")),
-                        });
+                            produtospromos.Add(new
+                            {
+                                id = reader.GetInt32(reader.GetOrdinal("ID")),
+                                produto_id = reader.GetInt32(reader.GetOrdinal("ID_PRODUTO")),
+                                quantidade_em_promocao = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_EM_PROMOCAO")),
+                                quantidade_maxima_cliente = reader.GetDecimal(reader.GetOrdinal("QUANTIDADE_MAXIMA_CLIENTE")),
+                                valor = reader.GetDecimal(reader.GetOrdinal("VALOR")),
+                                id_campanha_promo_prod = reader.GetInt32(reader.GetOrdinal("id_campanha_promo_prod")),
+                                qtda_vendida = reader.GetDecimal(reader.GetOrdinal("qtda_vendida")),
+                                id_tipo_estoque_produto = reader.GetInt32(reader.GetOrdinal("id_tipo_estoque_produto")),
+                                valor_venda = reader.GetDecimal(reader.GetOrdinal("VALOR_VENDA")),
+                            });
+                        }
                     }
                 }
             }
-
             return produtospromos.ToArray();
+
         }
+
         private dynamic[] GetMovimentoCaixa2FromDatabase()
         {
             var caixas = new List<dynamic>();
@@ -3722,7 +3949,7 @@ namespace LsiGestor
         }
         private static readonly HttpClient httpClient = new HttpClient
         {
-            Timeout = TimeSpan.FromMinutes(30) // Ajuste o tempo conforme necess�rio
+            Timeout = TimeSpan.FromMinutes(10) // Ajuste o tempo conforme necess�rio
         };
 
         private void groupBoxActions_Enter(object sender, EventArgs e)
